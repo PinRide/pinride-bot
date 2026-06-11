@@ -1,13 +1,14 @@
 {
   "name": "maps-to-uber-bot",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "WhatsApp bot that converts Google Maps links to Uber deep links",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "node-fetch": "2.7.0"
   },
   "engines": {
     "node": ">=18.0.0"
