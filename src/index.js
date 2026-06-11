@@ -10,8 +10,8 @@ const {
   VERIFY_TOKEN,
   PHONE_NUMBER_ID,
   APP_SECRET,
-  PORT = 3000,
 } = process.env;
+const PORT = process.env.PORT || 3000;
 
 function extractCoords(url) {
   const patterns = [
