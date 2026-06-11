@@ -1,43 +1,31 @@
-import express from "express";
-import crypto from "crypto";
-import fetch from "node-fetch";
-import * as dotenv from "dotenv";
-
-dotenv.config();
+const express = require("express");
+const crypto = require("crypto");
+const https = require("https");
 
 const app = express();
 app.use(express.json());
 
-// ─── Config ───────────────────────────────────────────────────────────────────
 const {
-  WHATSAPP_TOKEN,       // Meta permanent system user token
-  VERIFY_TOKEN,         // Your own secret string for webhook verification
-  PHONE_NUMBER_ID,      // WhatsApp Business phone number ID
-  APP_SECRET,           // Meta app secret (for payload signature verification)
+  WHATSAPP_TOKEN,
+  VERIFY_TOKEN,
+  PHONE_NUMBER_ID,
+  APP_SECRET,
   PORT = 3000,
 } = process.env;
 
-// ─── Coordinate extraction ────────────────────────────────────────────────────
-// Handles all common Google Maps URL formats
 function extractCoords(url) {
   const patterns = [
-    // @lat,lng (standard maps URL after navigation)
     /@(-?\d+\.?\d+),(-?\d+\.?\d+)/,
-    // ?q=lat,lng
     /[?&]q=(-?\d+\.?\d+),(-?\d+\.?\d+)/,
-    // ?ll=lat,lng
     /[?&]ll=(-?\d+\.?\d+),(-?\d+\.?\d+)/,
-    // /place/name/@lat,lng
     /\/place\/[^@]+@(-?\d+\.?\d+),(-?\d+\.?\d+)/,
-    // daddr=lat,lng
     /daddr=(-?\d+\.?\d+),(-?\d+\.?\d+)/,
   ];
-
-  for (const pattern of patterns) {
-    const match = url.match(pattern);
-    if (match) {
-      const lat = parseFloat(match[1]);
-      const lng = parseFloat(match[2]);
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m) {
+      const lat = parseFloat(m[1]);
+      const lng = parseFloat(m[2]);
       if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
         return { lat, lng };
       }
@@ -46,156 +34,127 @@ function extractCoords(url) {
   return null;
 }
 
-// Resolve a short link (goo.gl / maps.app.goo.gl) by following redirects
-async function resolveShortLink(url) {
-  try {
-    const res = await fetch(url, {
-      method: "HEAD",
-      redirect: "follow",
-      timeout: 5000,
-    });
-    return res.url;
-  } catch {
-    return null;
-  }
-}
-
-// Extract all URLs from a message body
 function extractUrls(text) {
   const urlRegex = /https?:\/\/[^\s]+/g;
   return text.match(urlRegex) || [];
 }
 
-// ─── Uber deep link builder ───────────────────────────────────────────────────
-function buildUberLink(lat, lng, nickname = "Destination") {
-  const params = new URLSearchParams({
-    action: "setPickup",
-    "pickup[0][latitude]": "",
-    "pickup[0][longitude]": "",
-    "dropoff[latitude]": lat.toFixed(6),
-    "dropoff[longitude]": lng.toFixed(6),
-    "dropoff[nickname]": nickname,
-  });
-
-  // Universal deep link — works on iOS, Android, and mobile web
-  return `https://m.uber.com/ul/?action=setPickup&pickup=my_location&dropoff[latitude]=${lat.toFixed(6)}&dropoff[longitude]=${lng.toFixed(6)}&dropoff[nickname]=${encodeURIComponent(nickname)}`;
+function buildUberLink(lat, lng) {
+  return `https://m.uber.com/ul/?action=setPickup&pickup=my_location&dropoff[latitude]=${lat.toFixed(6)}&dropoff[longitude]=${lng.toFixed(6)}&dropoff[nickname]=Destination`;
 }
 
-// ─── WhatsApp Cloud API sender ────────────────────────────────────────────────
-async function sendWhatsAppMessage(to, text) {
-  const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
-
-  const body = {
+function sendWhatsAppMessage(to, text, callback) {
+  const body = JSON.stringify({
     messaging_product: "whatsapp",
     to,
     type: "text",
     text: { body: text },
-  };
+  });
 
-  const res = await fetch(url, {
+  const options = {
+    hostname: "graph.facebook.com",
+    path: `/v19.0/${PHONE_NUMBER_ID}/messages`,
     method: "POST",
     headers: {
       Authorization: `Bearer ${WHATSAPP_TOKEN}`,
       "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body),
     },
-    body: JSON.stringify(body),
+  };
+
+  const req = https.request(options, (res) => {
+    let data = "";
+    res.on("data", (chunk) => { data += chunk; });
+    res.on("end", () => { if (callback) callback(null, data); });
   });
-
-  if (!res.ok) {
-    const err = await res.json();
-    console.error("WhatsApp send error:", JSON.stringify(err));
-  }
-
-  return res.ok;
+  req.on("error", (e) => { if (callback) callback(e); });
+  req.write(body);
+  req.end();
 }
 
-// ─── Core bot logic ───────────────────────────────────────────────────────────
-async function handleIncomingMessage(from, messageBody) {
-  const text = messageBody?.trim();
+function resolveShortLink(url, callback) {
+  try {
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: "HEAD",
+    };
+    const req = https.request(options, (res) => {
+      const location = res.headers.location;
+      callback(null, location || url);
+    });
+    req.on("error", () => callback(null, url));
+    req.setTimeout(5000, () => { req.destroy(); callback(null, url); });
+    req.end();
+  } catch (e) {
+    callback(null, url);
+  }
+}
+
+function handleMessage(from, text) {
   if (!text) return;
 
-  console.log(`📩 Message from ${from}: ${text.substring(0, 80)}`);
-
-  // Greeting detection
   const greetings = ["hi", "hello", "hey", "start", "help", "/start"];
-  if (greetings.includes(text.toLowerCase())) {
-    await sendWhatsAppMessage(
-      from,
-      `👋 Hi! I'm the *Maps → Uber* bot.\n\nForward me any Google Maps link and I'll instantly send you an Uber link that opens directly at that location — no searching, no typing.\n\nJust paste or forward a Google Maps URL to get started! 📍`
+  if (greetings.includes(text.toLowerCase().trim())) {
+    sendWhatsAppMessage(from,
+      "👋 Hi! I'm the *Maps → Uber* bot.\n\nForward me any Google Maps link and I'll instantly send you an Uber link that opens directly at that location — no searching, no typing.\n\nJust paste a Google Maps URL to get started! 📍"
     );
     return;
   }
 
-  // Find URLs in the message
   const urls = extractUrls(text);
-  const mapsUrls = urls.filter(
-    (u) =>
-      u.includes("maps.google") ||
-      u.includes("google.com/maps") ||
-      u.includes("maps.app.goo.gl") ||
-      u.includes("goo.gl/maps")
+  const mapsUrls = urls.filter(u =>
+    u.includes("maps.google") ||
+    u.includes("google.com/maps") ||
+    u.includes("maps.app.goo.gl") ||
+    u.includes("goo.gl/maps")
   );
 
   if (mapsUrls.length === 0) {
-    await sendWhatsAppMessage(
-      from,
-      `❓ I didn't spot a Google Maps link in that message.\n\nForward me a Google Maps link and I'll convert it to an Uber link. You can get a Maps link by:\n1. Open Google Maps\n2. Long-press on any location\n3. Tap *Share* → copy the link\n4. Paste it here`
+    sendWhatsAppMessage(from,
+      "❓ I didn't spot a Google Maps link in that message.\n\nForward me a Google Maps link and I'll convert it to an Uber link!"
     );
     return;
   }
 
-  // Process the first Maps URL found
-  let mapUrl = mapsUrls[0];
+  const mapUrl = mapsUrls[0];
+  const isShort = mapUrl.includes("goo.gl") || mapUrl.includes("maps.app.goo.gl");
 
-  // Resolve short links
-  const isShortLink =
-    mapUrl.includes("goo.gl") || mapUrl.includes("maps.app.goo.gl");
-
-  if (isShortLink) {
-    await sendWhatsAppMessage(from, `🔗 Resolving link...`);
-    const resolved = await resolveShortLink(mapUrl);
-    if (resolved) {
-      mapUrl = resolved;
-      console.log(`Resolved to: ${mapUrl}`);
-    } else {
-      await sendWhatsAppMessage(
-        from,
-        `⚠️ Couldn't resolve that short link. Try opening Google Maps, copying the full URL from the address bar, and sending that instead.`
+  if (isShort) {
+    sendWhatsAppMessage(from, "🔗 Resolving link...");
+    resolveShortLink(mapUrl, (err, resolved) => {
+      const coords = extractCoords(resolved || mapUrl);
+      if (!coords) {
+        sendWhatsAppMessage(from, "⚠️ Couldn't extract coordinates. Try copying the full Google Maps URL from your browser.");
+        return;
+      }
+      const link = buildUberLink(coords.lat, coords.lng);
+      sendWhatsAppMessage(from,
+        `✅ Got it! Here's your Uber link:\n\n${link}\n\n📍 ${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}\n\n_Tap the link to open Uber with this destination pre-filled._`
       );
-      return;
-    }
+    });
+    return;
   }
 
   const coords = extractCoords(mapUrl);
-
   if (!coords) {
-    await sendWhatsAppMessage(
-      from,
-      `⚠️ I found a Maps link but couldn't extract the exact coordinates.\n\nTry this: open the location in Google Maps → tap the pin → the coordinates will appear at the top of the screen. Copy and send me just those numbers (e.g. *25.197, 55.274*) and I'll build the Uber link.`
-    );
+    sendWhatsAppMessage(from, "⚠️ Found a Maps link but couldn't extract coordinates. Try sharing the full URL from Google Maps.");
     return;
   }
 
-  const uberLink = buildUberLink(coords.lat, coords.lng);
-
-  await sendWhatsAppMessage(
-    from,
-    `✅ Got it! Here's your Uber link:\n\n${uberLink}\n\n📍 Coordinates: ${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}\n\n_Tap the link on your phone to open Uber with this destination pre-filled._`
-  );
-
-  console.log(
-    `✅ Sent Uber link to ${from} for coords ${coords.lat}, ${coords.lng}`
+  const link = buildUberLink(coords.lat, coords.lng);
+  sendWhatsAppMessage(from,
+    `✅ Got it! Here's your Uber link:\n\n${link}\n\n📍 ${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}\n\n_Tap the link to open Uber with this destination pre-filled._`
   );
 }
 
-// ─── Webhook verification (GET) ───────────────────────────────────────────────
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ Webhook verified by Meta");
+    console.log("✅ Webhook verified");
     res.status(200).send(challenge);
   } else {
     console.warn("❌ Webhook verification failed");
@@ -203,64 +162,36 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// ─── Webhook payload (POST) ───────────────────────────────────────────────────
-app.post("/webhook", async (req, res) => {
-  // Verify payload signature
-  const signature = req.headers["x-hub-signature-256"];
-  if (APP_SECRET && signature) {
-    const expectedSig =
-      "sha256=" +
-      crypto
-        .createHmac("sha256", APP_SECRET)
-        .update(JSON.stringify(req.body))
-        .digest("hex");
-    if (signature !== expectedSig) {
-      console.warn("❌ Invalid signature — ignoring payload");
-      return res.sendStatus(403);
-    }
-  }
-
-  // Always respond 200 immediately (Meta requires < 5s)
+app.post("/webhook", (req, res) => {
   res.sendStatus(200);
-
-  // Process asynchronously
   try {
     const body = req.body;
     if (body.object !== "whatsapp_business_account") return;
-
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value;
-        if (!value?.messages) continue;
-
+        if (!value || !value.messages) continue;
         for (const message of value.messages) {
-          if (message.type !== "text") {
-            // Handle location pins shared natively from WhatsApp
-            if (message.type === "location") {
-              const { latitude, longitude } = message.location;
-              const uberLink = buildUberLink(latitude, longitude, "Shared pin");
-              await sendWhatsAppMessage(
-                message.from,
-                `✅ Got your location pin! Here's your Uber link:\n\n${uberLink}\n\n📍 ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`
-              );
-              continue;
-            }
-            continue;
+          if (message.type === "location") {
+            const { latitude, longitude } = message.location;
+            const link = buildUberLink(latitude, longitude);
+            sendWhatsAppMessage(message.from,
+              `✅ Got your location pin!\n\n${link}\n\n📍 ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`
+            );
+          } else if (message.type === "text") {
+            handleMessage(message.from, message.text && message.text.body);
           }
-
-          await handleIncomingMessage(message.from, message.text?.body);
         }
       }
     }
-  } catch (err) {
-    console.error("Webhook processing error:", err);
+  } catch (e) {
+    console.error("Webhook error:", e);
   }
 });
 
-// ─── Health check ─────────────────────────────────────────────────────────────
-app.get("/health", (_, res) => res.json({ status: "ok", bot: "maps-to-uber" }));
+app.get("/health", (req, res) => res.json({ status: "ok", bot: "maps-to-uber" }));
 
 app.listen(PORT, () => {
-  console.log(`🚀 Maps→Uber bot running on port ${PORT}`);
+  console.log(`🚀 Maps-Uber bot running on port ${PORT}`);
   console.log(`📡 Webhook endpoint: POST /webhook`);
 });
