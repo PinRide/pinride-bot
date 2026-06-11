@@ -191,7 +191,7 @@ app.post("/webhook", (req, res) => {
 
 app.get("/health", (req, res) => res.json({ status: "ok", bot: "maps-to-uber" }));
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Maps-Uber bot running on port ${PORT}`);
   console.log(`📡 Webhook endpoint: POST /webhook`);
 });
