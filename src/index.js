@@ -15,48 +15,91 @@ console.log("PHONE_NUMBER_ID:", PHONE_NUMBER_ID ? "set" : "MISSING");
 console.log("WHATSAPP_TOKEN:", WHATSAPP_TOKEN ? "set" : "MISSING");
 console.log("VERIFY_TOKEN:", VERIFY_TOKEN ? "set" : "MISSING");
 
+function fetchBody(url) {
+  return new Promise((resolve) => {
+    const lib = url.startsWith("https") ? https : http;
+    const req = lib.request(url, { method: "GET" }, (res) => {
+      // If this GET itself redirects further, follow that instead of reading the body.
+      const location = res.headers["location"];
+      if (location) {
+        res.resume(); // discard body
+        resolveRedirect(location).then((finalUrl) => fetchBody(finalUrl)).then(resolve);
+        return;
+      }
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk;
+        // Cap how much we read — the pin coords appear early in the
+        // document; no need to download the whole page.
+        if (data.length > 500000) {
+          req.destroy();
+        }
+      });
+      res.on("end", () => resolve(data));
+      res.on("error", () => resolve(""));
+    });
+    req.on("error", () => resolve(""));
+    req.setTimeout(8000, () => { req.destroy(); resolve(""); });
+    req.end();
+  });
+}
+
 function extractCoords(url) {
   // IMPORTANT: order matters. The !3d/!4d pair is the actual PIN marker
   // location. The @lat,lng pair is just the map VIEWPORT center, which can
-  // drift to a nearby road/building and is NOT reliable for an exact pin.
-  // Always try the precise pin pattern first.
+  // drift to a nearby road/building or labelled POI and is NOT reliable
+  // for an exact pin.
   const patterns = [
-    /!3d(-?\d+\.?\d+)!4d(-?\d+\.?\d+)/,        // precise pin marker (preferred)
-    /[?&]q=(-?\d+\.?\d+),(-?\d+\.?\d+)/,        // explicit query coords
-    /[?&]ll=(-?\d+\.?\d+),(-?\d+\.?\d+)/,       // explicit ll param
-    /\/place\/[^@]+@(-?\d+\.?\d+),(-?\d+\.?\d+)/, // place url fallback
-    /@(-?\d+\.?\d+),(-?\d+\.?\d+)/,             // viewport center (last resort, least precise)
+    { re: /!3d(-?\d+\.?\d+)!4d(-?\d+\.?\d+)/, precise: true },        // precise pin marker (preferred)
+    { re: /[?&]q=(-?\d+\.?\d+),(-?\d+\.?\d+)/, precise: true },        // explicit query coords
+    { re: /[?&]ll=(-?\d+\.?\d+),(-?\d+\.?\d+)/, precise: true },       // explicit ll param
+    { re: /\/place\/[^@]+@(-?\d+\.?\d+),(-?\d+\.?\d+)/, precise: false }, // place url fallback (viewport-based)
+    { re: /@(-?\d+\.?\d+),(-?\d+\.?\d+)/, precise: false },            // viewport center (last resort, least precise)
   ];
-  for (const p of patterns) {
-    const m = url.match(p);
+  for (const { re, precise } of patterns) {
+    const m = url.match(re);
     if (m) {
       const lat = parseFloat(m[1]);
       const lng = parseFloat(m[2]);
       if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
-        return { lat, lng };
+        return { lat, lng, precise };
       }
     }
   }
   return null;
 }
 
-function resolveRedirect(url) {
+function resolveRedirect(url, hopCount = 0) {
   return new Promise((resolve) => {
+    // Safety cap — real Google Maps redirect chains are typically 1-4 hops.
+    if (hopCount >= 8) {
+      console.log("Max redirect hops reached, using last known URL:", url);
+      resolve(url);
+      return;
+    }
+
     const lib = url.startsWith("https") ? https : http;
     const req = lib.request(url, { method: "HEAD" }, (res) => {
       const location = res.headers["location"];
       if (location) {
-        console.log("Redirected to:", location);
-        if (location.includes("google.com/maps")) {
-          resolve(location);
-        } else {
-          resolveRedirect(location).then(resolve);
-        }
+        console.log(`Redirect hop ${hopCount + 1}:`, location);
+        // IMPORTANT: do NOT stop just because the URL "looks like" a maps
+        // URL. Intermediate Google redirects can already contain
+        // "google.com/maps" while still being a partial hop that resolves
+        // to a nearby named place rather than the actual dropped pin.
+        // Always keep following redirects until there is no more
+        // "location" header — that's the true final destination.
+        resolveRedirect(location, hopCount + 1).then(resolve);
       } else {
+        // No more redirects — this is the final, fully-resolved URL.
+        console.log("Final resolved URL:", url);
         resolve(url);
       }
     });
-    req.on("error", () => resolve(url));
+    req.on("error", (e) => {
+      console.log("Redirect resolution error, using last known URL:", e.message);
+      resolve(url);
+    });
     req.setTimeout(6000, () => { req.destroy(); resolve(url); });
     req.end();
   });
@@ -112,10 +155,34 @@ async function processMapLink(from, mapsUrl) {
     console.log("Resolved to:", fullUrl);
   }
 
-  const coords = extractCoords(fullUrl);
+  let coords = extractCoords(fullUrl);
+
+  // If the URL itself didn't give us a precise pin (!3d!4d / q= / ll=),
+  // fetch the actual page content — Google sometimes only embeds the
+  // exact dropped-pin coordinates in the page's data, not in the URL,
+  // especially for unnamed locations. Without this, we'd silently fall
+  // back to the viewport center (@lat,lng), which can land on a nearby
+  // landmark instead of the real pin.
+  if (!coords || !coords.precise) {
+    console.log("No precise coords in URL, fetching page body for exact pin...");
+    const body = await fetchBody(fullUrl);
+    if (body) {
+      const bodyCoords = extractCoords(body);
+      if (bodyCoords && bodyCoords.precise) {
+        coords = bodyCoords;
+      } else if (!coords && bodyCoords) {
+        coords = bodyCoords;
+      }
+    }
+  }
+
   if (!coords) {
     await sendMessage(from, "⚠️ Couldn't read the coordinates from that link.\n\nTry this: open Google Maps → long press on the exact location → tap the coordinates that appear at the top → Share → Copy link. Then paste it here!");
     return;
+  }
+
+  if (!coords.precise) {
+    console.log("Warning: falling back to imprecise (viewport) coordinates for", fullUrl);
   }
 
   const uberLink = `https://m.uber.com/ul/?action=setPickup&pickup=my_location&dropoff[latitude]=${coords.lat.toFixed(6)}&dropoff[longitude]=${coords.lng.toFixed(6)}&dropoff[nickname]=Destination`;
