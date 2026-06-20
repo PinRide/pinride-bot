@@ -15,35 +15,6 @@ console.log("PHONE_NUMBER_ID:", PHONE_NUMBER_ID ? "set" : "MISSING");
 console.log("WHATSAPP_TOKEN:", WHATSAPP_TOKEN ? "set" : "MISSING");
 console.log("VERIFY_TOKEN:", VERIFY_TOKEN ? "set" : "MISSING");
 
-function fetchBody(url) {
-  return new Promise((resolve) => {
-    const lib = url.startsWith("https") ? https : http;
-    const req = lib.request(url, { method: "GET" }, (res) => {
-      // If this GET itself redirects further, follow that instead of reading the body.
-      const location = res.headers["location"];
-      if (location) {
-        res.resume(); // discard body
-        resolveRedirect(location).then((finalUrl) => fetchBody(finalUrl)).then(resolve);
-        return;
-      }
-      let data = "";
-      res.on("data", (chunk) => {
-        data += chunk;
-        // Cap how much we read — the pin coords appear early in the
-        // document; no need to download the whole page.
-        if (data.length > 500000) {
-          req.destroy();
-        }
-      });
-      res.on("end", () => resolve(data));
-      res.on("error", () => resolve(""));
-    });
-    req.on("error", () => resolve(""));
-    req.setTimeout(8000, () => { req.destroy(); resolve(""); });
-    req.end();
-  });
-}
-
 function extractCoords(url) {
   // IMPORTANT: order matters. The !3d/!4d pair is the actual PIN marker
   // location. The @lat,lng pair is just the map VIEWPORT center, which can
@@ -155,34 +126,11 @@ async function processMapLink(from, mapsUrl) {
     console.log("Resolved to:", fullUrl);
   }
 
-  let coords = extractCoords(fullUrl);
-
-  // If the URL itself didn't give us a precise pin (!3d!4d / q= / ll=),
-  // fetch the actual page content — Google sometimes only embeds the
-  // exact dropped-pin coordinates in the page's data, not in the URL,
-  // especially for unnamed locations. Without this, we'd silently fall
-  // back to the viewport center (@lat,lng), which can land on a nearby
-  // landmark instead of the real pin.
-  if (!coords || !coords.precise) {
-    console.log("No precise coords in URL, fetching page body for exact pin...");
-    const body = await fetchBody(fullUrl);
-    if (body) {
-      const bodyCoords = extractCoords(body);
-      if (bodyCoords && bodyCoords.precise) {
-        coords = bodyCoords;
-      } else if (!coords && bodyCoords) {
-        coords = bodyCoords;
-      }
-    }
-  }
+  const coords = extractCoords(fullUrl);
 
   if (!coords) {
     await sendMessage(from, "⚠️ Couldn't read the coordinates from that link.\n\nTry this: open Google Maps → long press on the exact location → tap the coordinates that appear at the top → Share → Copy link. Then paste it here!");
     return;
-  }
-
-  if (!coords.precise) {
-    console.log("Warning: falling back to imprecise (viewport) coordinates for", fullUrl);
   }
 
   const uberLink = `https://m.uber.com/ul/?action=setPickup&pickup=my_location&dropoff[latitude]=${coords.lat.toFixed(6)}&dropoff[longitude]=${coords.lng.toFixed(6)}&dropoff[nickname]=Destination`;
