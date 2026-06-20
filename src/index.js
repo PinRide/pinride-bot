@@ -16,11 +16,16 @@ console.log("WHATSAPP_TOKEN:", WHATSAPP_TOKEN ? "set" : "MISSING");
 console.log("VERIFY_TOKEN:", VERIFY_TOKEN ? "set" : "MISSING");
 
 function extractCoords(url) {
+  // IMPORTANT: order matters. The !3d/!4d pair is the actual PIN marker
+  // location. The @lat,lng pair is just the map VIEWPORT center, which can
+  // drift to a nearby road/building and is NOT reliable for an exact pin.
+  // Always try the precise pin pattern first.
   const patterns = [
-    /@(-?\d+\.?\d+),(-?\d+\.?\d+)/,
-    /[?&]q=(-?\d+\.?\d+),(-?\d+\.?\d+)/,
-    /[?&]ll=(-?\d+\.?\d+),(-?\d+\.?\d+)/,
-    /\/place\/[^@]+@(-?\d+\.?\d+),(-?\d+\.?\d+)/,
+    /!3d(-?\d+\.?\d+)!4d(-?\d+\.?\d+)/,        // precise pin marker (preferred)
+    /[?&]q=(-?\d+\.?\d+),(-?\d+\.?\d+)/,        // explicit query coords
+    /[?&]ll=(-?\d+\.?\d+),(-?\d+\.?\d+)/,       // explicit ll param
+    /\/place\/[^@]+@(-?\d+\.?\d+),(-?\d+\.?\d+)/, // place url fallback
+    /@(-?\d+\.?\d+),(-?\d+\.?\d+)/,             // viewport center (last resort, least precise)
   ];
   for (const p of patterns) {
     const m = url.match(p);
